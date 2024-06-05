@@ -30,23 +30,33 @@ object AnchiraHelper {
         }
         .joinToString(", ") { it }
 
-    fun createChapter(entry: Entry, anchiraData: List<EntryKey>) =
+    fun createChapter(
+        entry: Entry,
+        anchiraData: List<EntryKey>,
+        index: Int = 0,
+        appendPageCount: Boolean = true,
+        chapNumberPrefix: Boolean = true,
+    ) =
         SChapter.create().apply {
-            val chSuffix = CHAPTER_SUFFIX_RE.find(entry.title)?.value.orEmpty()
+            val chSuffix = CHAPTER_SUFFIX_RE.findAll(entry.title).lastOrNull()?.value.orEmpty()
             val chNumber =
-                chSuffix.replace(Regex("[^.\\d]"), "").trim('.').takeUnless { it.isEmpty() } ?: "1"
+                chSuffix.replace(Regex("[^.\\d]"), "").trim('.')
+                    .takeUnless { it.isEmpty() } ?: "1"
             val source = Regex("fakku|irodori").find(
                 anchiraData.find { it.id == entry.id }?.url.orEmpty(),
             )?.value.orEmpty().titleCase()
             url = "/g/${entry.id}/${entry.key}"
-            name = "$chNumber. ${entry.title.removeSuffix(chSuffix)}"
+            name =
+                if (chapNumberPrefix) "$chNumber. ${entry.title.removeSuffix(chSuffix)}" else entry.title
             date_upload = entry.publishedAt * 1000
-            chapter_number = chNumber.toFloat()
+            chapter_number =
+                if (chNumber != "1") chNumber.toFloat() else "1.%02d".format(index).toFloat()
             scanlator = buildString {
                 if (source.isNotEmpty()) {
-                    append("$source - ")
+                    append(source)
+                    if (appendPageCount) append(" - ")
                 }
-                append("${entry.pages} pages")
+                if (appendPageCount) append("${entry.pages} pages")
             }
         }
 

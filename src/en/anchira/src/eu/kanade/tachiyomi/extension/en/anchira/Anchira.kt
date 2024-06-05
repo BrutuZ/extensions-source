@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.en.anchira
 import android.annotation.SuppressLint
 import android.app.Application
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -11,6 +12,7 @@ import eu.kanade.tachiyomi.extension.en.anchira.AnchiraHelper.getCdn
 import eu.kanade.tachiyomi.extension.en.anchira.AnchiraHelper.getPathFromUrl
 import eu.kanade.tachiyomi.extension.en.anchira.AnchiraHelper.prepareTags
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -24,12 +26,18 @@ import eu.kanade.tachiyomi.source.model.UpdateStrategy
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import rx.Observable
 import uy.kohesive.injekt.Injekt
@@ -219,6 +227,28 @@ class Anchira : HttpSource(), ConfigurableSource {
 
     // Details
 
+    private fun parseLibraryResponse(response: Response): List<Entry> {
+        val chapterList = mutableListOf<Entry>()
+        var results = json.decodeFromString<LibraryResponse>(response.body.string())
+        val pages = min(5, ceil((results.total.toFloat() / results.limit)).toInt())
+        for (page in 1..pages) {
+            chapterList.addAll(results.entries)
+
+            if (page < pages) {
+                results = json.decodeFromString<LibraryResponse>(
+                    client.newCall(
+                        GET(
+                            response.request.url.newBuilder()
+                                .setQueryParameter("page", (page + 1).toString()).build(),
+                            headers,
+                        ),
+                    ).execute().body.string(),
+                )
+            }
+        }
+        return chapterList
+    }
+
     override fun mangaDetailsRequest(manga: SManga): Request {
         return if (manga.url.startsWith("?")) {
             GET(libraryUrl + manga.url, headers)
@@ -229,23 +259,47 @@ class Anchira : HttpSource(), ConfigurableSource {
 
     override fun mangaDetailsParse(response: Response): SManga {
         return if (response.request.url.pathSegments.count() == libraryUrl.toHttpUrl().pathSegments.count()) {
-            val manga = latestUpdatesParse(response).mangas.first()
+            val results = parseLibraryResponse(response)
+            val lastEntry = results.last()
+            val totalPages = results.sumOf { it.pages }
             val query = response.request.url.queryParameter("s")
-            val cleanTitle = CHAPTER_SUFFIX_RE.replace(manga.title, "").trim()
-            manga.apply {
+            SManga.create().apply {
                 url = "?${response.request.url.query}"
-                description = "Bundled from $query"
-                title = "[Bundle] $cleanTitle"
+                title = CHAPTER_SUFFIX_RE.replace(lastEntry.title, "").trim()
+                thumbnail_url =
+                    "$cdnUrl/${lastEntry.id}/${lastEntry.key}/l/${lastEntry.cover?.name}"
+                val art = lastEntry.tags.filter { it.namespace == 1 }.joinToString(", ") { it.name }
+                    .ifEmpty { null }
+                artist = art
+                author = lastEntry.tags.filter { it.namespace == 2 }.joinToString(", ") { it.name }
+                    .ifEmpty { art }
+                description = buildString {
+                    append("\uD83D\uDCC4 Pages: ")
+                    append(totalPages)
+                    append("\n")
+
+                    append("Bundled from $query")
+                }
+                genre = prepareTags(
+                    results.flatMap { entry -> entry.tags }.distinct(),
+                    preferences.useTagGrouping,
+                )
                 update_strategy = UpdateStrategy.ALWAYS_UPDATE
             }
         } else {
             val data = json.decodeFromString<Entry>(response.body.string())
+            val source = anchiraData.find { it.id == data.id }?.url.orEmpty()
+            val size = if (data.size != null) {
+                "%.2f MB".format(data.size / 1048576F)
+            } else {
+                "Unknown"
+            }
 
             SManga.create().apply {
                 url = "/g/${data.id}/${data.key}"
                 title = data.title
                 thumbnail_url =
-                    "$cdnUrl/${data.id}/${data.key}/l/${data.images[data.thumbnailIndex].name}"
+                    "$cdnUrl/${data.id}/${data.key}/l/${(data.cover ?: data.images[data.thumbnailIndex]).name}"
                 val art = data.tags.filter { it.namespace == 1 }.joinToString(", ") { it.name }
                     .ifEmpty { null }
                 artist = art
@@ -254,6 +308,20 @@ class Anchira : HttpSource(), ConfigurableSource {
                 genre = prepareTags(data.tags, preferences.useTagGrouping)
                 update_strategy = UpdateStrategy.ONLY_FETCH_ONCE
                 status = SManga.COMPLETED
+                description = buildString {
+                    append("\uD83D\uDCBE Size: ")
+                    append(size)
+                    append("\t ")
+
+                    append("\uD83D\uDCC4 Pages: ")
+                    append(data.pages)
+
+                    if (source.isNotEmpty()) {
+                        append("\n")
+                        append("\uD83C\uDF10 Source: ")
+                        append(source.substringBefore("?search"))
+                    }
+                }
             }
         }
     }
@@ -277,39 +345,49 @@ class Anchira : HttpSource(), ConfigurableSource {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val chapterList = mutableListOf<SChapter>()
-        if (response.request.url.pathSegments.count() == libraryUrl.toHttpUrl().pathSegments.count()) {
-            var results = json.decodeFromString<LibraryResponse>(response.body.string())
-            val pages = min(5, ceil((results.total.toFloat() / results.limit)).toInt())
-            for (page in 1..pages) {
-                results.entries.forEach { data ->
-                    chapterList.add(
-                        createChapter(data, anchiraData),
-                    )
-                }
-                if (page < pages) {
-                    results = json.decodeFromString<LibraryResponse>(
-                        client.newCall(
-                            GET(
-                                response.request.url.newBuilder()
-                                    .setQueryParameter("page", (page + 1).toString()).build(),
-                                headers,
-                            ),
-                        ).execute().body.string(),
-                    )
-                }
+        return if (response.request.url.pathSegments.count() == libraryUrl.toHttpUrl().pathSegments.count()) {
+            val entries = parseLibraryResponse(response)
+            entries.mapIndexed { index, entry ->
+                createChapter(
+                    entry,
+                    anchiraData,
+                    entries.size - 1 - index,
+                    preferences.appendPageCount,
+                    preferences.chapNumberPrefix,
+                )
             }
         } else {
             val data = json.decodeFromString<Entry>(response.body.string())
-            chapterList.add(
-                createChapter(data, anchiraData),
+            listOf(
+                createChapter(
+                    data,
+                    anchiraData,
+                    0,
+                    preferences.appendPageCount,
+                    preferences.chapNumberPrefix,
+                ),
             )
         }
-        return chapterList
     }
 
     override fun getChapterUrl(chapter: SChapter) = "$baseUrl/g/${getPathFromUrl(chapter.url)}"
 
+    // TODO: DO NOT COMMIT FROM HERE \/
+    override fun prepareNewChapter(chapter: SChapter, manga: SManga) {
+        Log.d("KSK", "Preparing... ${chapter.name}")
+        if (chapter.date_upload != 0L) return
+        Log.d("KSK", "Prepared!!! \\o/")
+        val entry = json.decodeFromString<Entry>(
+            client.newCall(GET(libraryUrl + chapter.url.substringAfter("/g"), headers))
+                .execute().body.string(),
+        )
+        chapter.date_upload = entry.publishedAt * 1000
+        manga.genre =
+            "${manga.genre}, ${prepareTags(entry.tags, preferences.useTagGrouping)}".split(", ")
+                .sorted().distinct().joinToString(", ")
+    }
+
+    // TODO: DO NOT COMMIT TO HERE /\
     // Page List
 
     override fun pageListRequest(chapter: SChapter) =
@@ -318,6 +396,62 @@ class Anchira : HttpSource(), ConfigurableSource {
     override fun pageListParse(response: Response): List<Page> {
         val data = json.decodeFromString<Entry>(response.body.string())
         val imageData = getImageData(data)
+        // TODO: DO NOT COMMIT FROM HERE \/
+        Log.d("KSK", "Got Image Data: ${imageData.hash}")
+        val gistEntry = anchiraData.find { it.id == data.id }
+        if (
+            gistEntry != null && (gistEntry.hash.isNullOrEmpty() || gistEntry.hash != imageData.hash) &&
+            client.newCall(
+                GET("https://api.github.com/search/issues?q=repo%3ABrutuZ%2Fgallery-data%20${imageData.hash}"),
+            ).execute().body.string().startsWith("{\n  \"total_count\": 0")
+        ) {
+            val msgDiscord =
+                """{"username": "Tachira", "avatar_url": "https://cdn.discordapp.com/emojis/1206376697709068308.webp", "content": "--id ${imageData.id} --key ${imageData.key} --hash ${imageData.hash}", "embeds": [{"title": "${data.title}", "url": "$baseUrl/g/${data.id}/${data.key}"}]}"""
+            Log.d("KSK", "Message:\n$msgDiscord")
+            client.newCall(
+                POST(
+                    "https://discord.com/api/webhooks/<discorb_webhook>>",
+                    body = msgDiscord.toRequestBody("application/json".toMediaType()),
+                ),
+            ).execute()
+            val msgGit = buildJsonObject {
+                put("title", data.title)
+                put(
+                    "labels",
+                    buildJsonArray {
+                        add("automated")
+                    },
+                )
+                put(
+                    "body",
+                    buildString {
+                        append("```json")
+                        append("\n{")
+                        append("\n  \"id\": ${imageData.id},")
+                        append("\n  \"key\": \"${imageData.key}\",")
+                        append("\n  \"hash\": \"${imageData.hash}\"")
+                        append("\n}")
+                        append("\n```")
+                    },
+                )
+            }.toString()
+//                """{"title": "${data.title}", "body": "```json\n\"id\": ${imageData.id}\nkey: ${imageData.key}\nhash: ${imageData.hash}\n```"}"""
+            val issue = client.newCall(
+                POST(
+                    "https://api.github.com/repos/BrutuZ/gallery-data/issues",
+                    body = msgGit.toRequestBody("application/json".toMediaType()),
+                    headers = headersBuilder()
+                        .add("Accept", "application/vnd.github+json")
+                        .add(
+                            "Authorization",
+                            "Bearer <github_PAT>>",
+                        )
+                        .add("X-GitHub-Api-Version", "2022-11-28").build(),
+                ),
+            ).execute()
+            Log.d("KSK", issue.body.string())
+        }
+        // TODO: DO NOT COMMIT TO HERE /\
 
         return data.images.mapIndexed { i, image ->
             Page(
@@ -379,9 +513,28 @@ class Anchira : HttpSource(), ConfigurableSource {
             setDefaultValue(false)
         }
 
+        val showPageCount = SwitchPreferenceCompat(screen.context).apply {
+            key = SHOW_PAGE_COUNT
+            title = "Show Page Count Below Chapters"
+            summary =
+                "Append page count to the source name (below the chapter title)"
+            setDefaultValue(true)
+        }
+
+        val chapNumberPrefix = SwitchPreferenceCompat(screen.context).apply {
+            key = CHAP_NUMBER_PREFIX
+            title = "Chapter Number Prefix on Titles"
+            summaryOn =
+                "Remove chapter number from chapter titles and add as a prefix"
+            summaryOff = "Leave chapter titles unchanged"
+            setDefaultValue(true)
+        }
+
         screen.addPreference(imageQualityPref)
         screen.addPreference(openSourcePref)
         screen.addPreference(useTagGrouping)
+        screen.addPreference(showPageCount)
+        screen.addPreference(chapNumberPrefix)
     }
 
     override fun getFilterList() = FilterList(
@@ -432,6 +585,12 @@ class Anchira : HttpSource(), ConfigurableSource {
     private val SharedPreferences.useTagGrouping
         get() = getBoolean(USE_TAG_GROUPING, false)
 
+    private val SharedPreferences.appendPageCount
+        get() = getBoolean(SHOW_PAGE_COUNT, true)
+
+    private val SharedPreferences.chapNumberPrefix
+        get() = getBoolean(CHAP_NUMBER_PREFIX, true)
+
     private fun resampledInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val url = request.url.toString()
@@ -468,6 +627,8 @@ class Anchira : HttpSource(), ConfigurableSource {
         private const val IMAGE_QUALITY_PREF = "image_quality"
         private const val OPEN_SOURCE_PREF = "use_manga_source"
         private const val USE_TAG_GROUPING = "use_tag_grouping"
+        private const val SHOW_PAGE_COUNT = "append_page_count"
+        private const val CHAP_NUMBER_PREFIX = "chap_number_prefix"
         private const val DATA_JSON =
             "https://raw.githubusercontent.com/LetrixZ/gallery-data/main/extension_data.min.json"
     }
